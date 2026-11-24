@@ -5,6 +5,7 @@ Adapted from the original vr_robot_teleop.py script.
 
 import asyncio
 import json
+import time
 import ssl
 import websockets
 import numpy as np
@@ -270,6 +271,8 @@ class VRWebSocketServer(BaseInputProvider):
                 gripper_closed=not trigger_active,  # Inverted: closed when trigger NOT active
                 metadata={
                     "source": "vr_trigger",
+                    "grip_active": grip_active,
+                    "received_at": time.monotonic(),
                     "trigger": trigger,
                     "trigger_active": trigger_active,
                     "thumbstick": thumbstick
@@ -303,6 +306,8 @@ class VRWebSocketServer(BaseInputProvider):
                     target_position=None,
                     metadata={
                         "source": f"vr_auto_reset_{hand}",
+                        "grip_active": grip_active,
+                        "received_at": time.monotonic(),
                         "reset_target_to_current": True,
                         "trigger": trigger,
                         "trigger_active": trigger_active,
@@ -341,6 +346,8 @@ class VRWebSocketServer(BaseInputProvider):
                     "relative_position": False,  # 标记为绝对位置
                     "vr_position": position_array.tolist(),
                     "scaled_position": absolute_position.tolist(),
+                    "grip_active": grip_active,
+                    "received_at": time.monotonic(),
                     "trigger": trigger,
                     "trigger_active": trigger_active,
                     "thumbstick": thumbstick

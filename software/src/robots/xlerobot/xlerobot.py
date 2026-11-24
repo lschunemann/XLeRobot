@@ -178,7 +178,11 @@ class XLerobot(Robot):
 
         self.bus1.connect()
         self.bus2.connect()
-        
+
+        # A crashed session can leave torque on; never write calibration to a powered motor.
+        self.bus1.disable_torque()
+        self.bus2.disable_torque()
+
         # Check if calibration file exists and ask user if they want to restore it
         if self.calibration_fpath.is_file():
             logger.info(f"Calibration file found at {self.calibration_fpath}")
@@ -338,9 +342,27 @@ class XLerobot(Robot):
             self.bus2.write("Operating_Mode", name, OperatingMode.VELOCITY.value)
         
         
+        # Torque drives each motor towards its goal register, which can be stale (0 after power-up).
+        self._hold_present_position(self.bus1, self.left_arm_motors + self.head_motors)
+        self._hold_present_position(self.bus2, self.right_arm_motors)
+        self.bus2.sync_write("Goal_Velocity", dict.fromkeys(self.base_motors, 0), num_retry=5)
+
         self.bus1.enable_torque()
         self.bus2.enable_torque()
-        
+
+    @staticmethod
+    def _hold_present_position(bus, motors: list[str], tolerance: int = 20) -> None:
+        """Make each motor's goal its present position, and check it, before torque is enabled."""
+        for name in motors:
+            present = bus.read("Present_Position", name, normalize=False, num_retry=3)
+            bus.write("Goal_Position", name, present, normalize=False, num_retry=3)
+            goal = bus.read("Goal_Position", name, normalize=False, num_retry=3)
+            if abs(goal - present) > tolerance:
+                raise RuntimeError(
+                    f"'{name}' is at {present} but its goal is {goal}: not enabling torque. "
+                    "Move it within its calibrated range and try again."
+                )
+
 
     def setup_motors(self) -> None:
         for motor in chain(reversed(self.left_arm_motors), reversed(self.head_motors)):
@@ -602,9 +624,11 @@ class XLerobot(Robot):
 
             # Ensure safe goal position for each arm and head
             goal_present_pos = {
-                key: (g_pos, present_pos[key]) for key, g_pos in chain(left_arm_pos.items(), right_arm_pos.items(), head_pos.items())
+                key: (g_pos, present_pos[key.removesuffix(".pos")]) for key, g_pos in chain(left_arm_pos.items(), right_arm_pos.items(), head_pos.items())
             }
-            safe_goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
+            safe_goal_pos = ensure_safe_goal_position(
+                goal_present_pos, float(self.config.max_relative_target)
+            )
 
             # Update the action with the safe goal positions
             left_arm_pos = {k: v for k, v in safe_goal_pos.items() if k in left_arm_pos}

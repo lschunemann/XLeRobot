@@ -20,6 +20,7 @@ import pygame
 
 # Local imports
 from vr_monitor import VRMonitor
+from vr_safety import SlewLimiter, grip_held, is_fresh
 from lerobot_robot_xlerobot import XLerobotConfig, XLerobot
 # from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.robot_utils import precise_sleep
@@ -52,6 +53,12 @@ HEAD_MOTOR_MAP = {
     "head_motor_1": "head_motor_1",
     "head_motor_2": "head_motor_2",
 }
+
+CONTROL_HZ = 30
+MAX_RELATIVE_TARGET = 20.0  # hard cap on goal minus present position
+JOINT_RATE = 40.0  # commanded units per second
+GRIPPER_RATE = 100.0
+RAMP_S = 2.0  # after each grip press, speed builds up from 20% to 100%
 
 # Joint calibration coefficients - manually edit
 # Format: [joint_name, zero_position_offset(degrees), scale_factor]
@@ -103,15 +110,12 @@ class SimpleTeleopArm:
         self.degree_step = 2
         self.xy_step = 0.005
         
-        # P control target positions, set to zero position
-        self.target_positions = {
-            "shoulder_pan": 0.0,
-            "shoulder_lift": 0.0,
-            "elbow_flex": 0.0,
-            "wrist_flex": 0.0,
-            "wrist_roll": 0.0,
-            "gripper": 0.0,
-        }
+        # Start by holding the pose the arm is in
+        self.target_positions = self.joint_positions.copy()
+        self.limiter = SlewLimiter(self.joint_positions, {"gripper": GRIPPER_RATE}, JOINT_RATE)
+        self.gripping = False
+        self.grip_started = 0.0
+        self.sync_to_command()
         self.zero_pos = {
             'shoulder_pan': 0.0,
             'shoulder_lift': 0.0,
@@ -120,6 +124,45 @@ class SimpleTeleopArm:
             'wrist_roll': 0.0,
             'gripper': 0.0
         }
+
+    def sync_to_command(self):
+        """Make the targets and the IK state match the last commanded pose; forget VR baselines."""
+        self.target_positions = self.limiter.value.copy()
+        lift, elbow = self.target_positions["shoulder_lift"], self.target_positions["elbow_flex"]
+        self.current_x, self.current_y = self.position_from_joints(lift, elbow)
+        # IK clamps to its own limits; this offset makes it start exactly at the commanded pose
+        ik_lift, ik_elbow = self.kinematics.inverse_kinematics(self.current_x, self.current_y)
+        self.ik_offset = (lift - ik_lift, elbow - ik_elbow)
+        self.pitch = self.target_positions["wrist_flex"] + lift + elbow
+        for name in ("prev_vr_pos", "prev_wrist_flex", "prev_wrist_roll"):
+            if hasattr(self, name):
+                delattr(self, name)
+
+    def position_from_joints(self, lift, elbow):
+        """Inverse of SO101Kinematics.inverse_kinematics (its forward_kinematics is not)."""
+        l1, l2 = self.kinematics.l1, self.kinematics.l2
+        offset1 = math.atan2(0.028, 0.11257)
+        offset2 = math.atan2(0.0052, 0.1349) + offset1
+        theta1 = math.radians(90 - lift) - offset1
+        theta2 = math.radians(elbow + 90) - offset2
+        return (
+            l1 * math.cos(theta1) + l2 * math.cos(theta1 - theta2),
+            l1 * math.sin(theta1) + l2 * math.sin(theta1 - theta2),
+        )
+
+    def update(self, vr_goal, dt, now):
+        """Follow the controller only while its grip is held and its data is fresh; else hold."""
+        held = grip_held(vr_goal, now)
+        if held != self.gripping:
+            self.gripping = held
+            self.grip_started = now
+            self.sync_to_command()
+            print(f"[{self.prefix}] {'following' if held else 'holding'}")
+        if held:
+            self.handle_vr_input(vr_goal, gripper_state=None)
+        ramp = 0.2 + 0.8 * min(1.0, (now - self.grip_started) / RAMP_S)
+        command = self.limiter.step(self.target_positions, dt * ramp)
+        return {f"{self.joint_map[j]}.pos": v for j, v in command.items()}
 
     def move_to_zero_position(self, robot):
         print(f"[{self.prefix}] Moving to Zero Position: {self.zero_pos} ......")
@@ -163,7 +206,6 @@ class SimpleTeleopArm:
             self.prev_vr_pos = current_vr_pos
             return  # Skip first frame to establish baseline
         
-        print(current_vr_pos)
         
         # Calculate relative change (delta) from previous frame
         vr_x = (current_vr_pos[0] - self.prev_vr_pos[0]) * 220 # Scale for the shoulder
@@ -238,6 +280,8 @@ class SimpleTeleopArm:
         
         try:
             joint2_target, joint3_target = self.kinematics.inverse_kinematics(self.current_x, self.current_y)
+            joint2_target += self.ik_offset[0]
+            joint3_target += self.ik_offset[1]
             # Smooth transition to new joint positions,  Smoothing factor 0-1, lower = smoother
             alpha = 0.1
             self.target_positions["shoulder_lift"] = (1-alpha) * self.target_positions.get("shoulder_lift", 0.0) + alpha * joint2_target
@@ -469,6 +513,7 @@ def main():
             id=getattr(args, "robot.id"),
             port1=getattr(args, "robot.port1"),
             port2=getattr(args, "robot.port2"),
+            max_relative_target=MAX_RELATIVE_TARGET,
         )
         robot = XLerobot(robot_config)
         
@@ -504,62 +549,30 @@ def main():
         right_arm = SimpleTeleopArm(RIGHT_JOINT_MAP, obs, kin_right, prefix="right")
         head_control = SimpleHeadControl(obs)
 
-        # Move both arms and head to zero position at start
-        left_arm.move_to_zero_position(robot)
-        right_arm.move_to_zero_position(robot)
-        head_control.move_to_zero_position(robot)
-        
         # Main VR control loop
-        print("Starting VR control loop. Press ESC to exit.")
+        print("Hold a grip to move that arm. Right thumbstick drives. Ctrl+C exits (arms go limp).")
+        head_action = {f"{m}.pos": v for m, v in head_control.target_positions.items()}
+        last = time.monotonic()
         try:
             while True:
-                # Get VR controller data
-                dual_goals = vr_monitor.get_latest_goal_nowait()
-                left_goal = dual_goals.get("left") if dual_goals else None
-                right_goal = dual_goals.get("right") if dual_goals else None
-                headset_goal = dual_goals.get("headset") if dual_goals else None
+                now = time.monotonic()
+                dt, last = now - last, now
+                goals = vr_monitor.get_latest_goal_nowait() or {}
+                right_goal = goals.get("right")
 
-                # Wait for VR connection before proceeding
-                if dual_goals is None:
-                    time.sleep(0.01)  # Wait 10ms for VR connection
-                    continue
-
-                # Handle VR input for both arms
-                left_arm.handle_vr_input(left_goal, gripper_state=None)
-                right_arm.handle_vr_input(right_goal, gripper_state=None)
-                
-                # Get actions from both arms and head
-                left_action = left_arm.p_control_action(robot)
-                right_action = right_arm.p_control_action(robot)
-                head_action = head_control.p_control_action(robot)
-
-                # Get base control from VR
-                print(f'right_goal: {right_goal}')
-                base_action = get_vr_base_action(right_goal, robot)
-                # speed_multiplier = get_vr_speed_control(right_goal)
-                
-                # if base_action:
-                #     for key in base_action:
-                #         if 'vel' in key or 'velocity' in key:  
-                            # base_action[key] *= speed_multiplier 
-
-                # Merge all actions
-                action = {**left_action, **right_action, **head_action, **base_action}
+                action = {
+                    **left_arm.update(goals.get("left"), dt, now),
+                    **right_arm.update(right_goal, dt, now),
+                    **head_action,
+                }
+                # Without fresh data no base velocity is sent, which send_action turns into a stop
+                if is_fresh(right_goal, now):
+                    action.update(get_vr_base_action(right_goal, robot))
                 robot.send_action(action)
-                
-                # Handle keyboard exit (press ESC to quit)
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        print("Quit event detected, exiting...")
-                        break
-                    elif event.type == pygame.KEYDOWN:
-                        if event.key == pygame.K_ESCAPE:
-                            print("ESC pressed, exiting...")
-                            break
-                else:
-                    continue  # Continue the while loop if no break occurred
-                break  # Break the while loop if a break occurred in the for loop
-                
+                time.sleep(max(0.0, 1 / CONTROL_HZ - (time.monotonic() - now)))
+
+        except KeyboardInterrupt:
+            print("Stopping...")
         finally:
             robot.disconnect()
             print("VR teleoperation ended.")
